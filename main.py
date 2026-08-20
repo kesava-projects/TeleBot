@@ -20,14 +20,21 @@ logger = logging.getLogger("AutoResponder")
 # 2. Load environment variables
 load_dotenv()
 
-API_ID_RAW = os.getenv("TELEGRAM_API_ID")
-API_HASH = os.getenv("TELEGRAM_API_HASH")
-STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION", "").strip()
-SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME", "user_session").strip()
-TARGET_CONTACT_RAW = os.getenv("TARGET_CONTACT", "ALL").strip()
-AUTO_REPLY_MESSAGE = os.getenv("AUTO_REPLY_MESSAGE", "Hi, Harsha is currently busy")
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "30"))  # Cooldown per user to prevent spam
-PORT = os.getenv("PORT")  # Automatically injected by Render for Web Services
+def clean_env(key: str, default: str = "") -> str:
+    """Safely retrieves and cleans environment variables (strips quotes & whitespace)."""
+    val = os.getenv(key, default)
+    if val is None:
+        return default
+    return val.strip().strip('"').strip("'")
+
+API_ID_RAW = clean_env("TELEGRAM_API_ID")
+API_HASH = clean_env("TELEGRAM_API_HASH")
+STRING_SESSION = clean_env("TELEGRAM_STRING_SESSION")
+SESSION_NAME = clean_env("TELEGRAM_SESSION_NAME", "user_session")
+TARGET_CONTACT_RAW = clean_env("TARGET_CONTACT", "ALL")
+AUTO_REPLY_MESSAGE = clean_env("AUTO_REPLY_MESSAGE", "Hi, Harsha is currently busy")
+COOLDOWN_SECONDS = int(clean_env("COOLDOWN_SECONDS", "30"))  # Cooldown per user to prevent spam
+PORT = clean_env("PORT")  # Injected automatically by Render for Web Services
 
 # Track last reply timestamp per chat_id for cooldown
 last_reply_time = {}
@@ -77,11 +84,10 @@ async def main():
     # Validate API credentials
     if not API_ID_RAW or not API_HASH:
         logger.error("Missing TELEGRAM_API_ID or TELEGRAM_API_HASH in environment variables.")
-        print("\n[!] Please configure your Telegram API credentials:")
+        print("\n[!] Please configure your Telegram API credentials in Render Environment Variables:")
         print("    TELEGRAM_API_ID=your_api_id")
         print("    TELEGRAM_API_HASH=your_api_hash")
-        print("    TELEGRAM_STRING_SESSION=your_string_session (Required on Render)")
-        print("    TARGET_CONTACT=ALL  (or specific ID/username)\n")
+        print("    TELEGRAM_STRING_SESSION=your_string_session\n")
         sys.exit(1)
 
     try:
@@ -99,20 +105,39 @@ async def main():
 
     # Initialize TelegramClient with StringSession (cloud/Render) or SQLite Session (local)
     if STRING_SESSION:
-        logger.info("🔑 Initializing client with StringSession (Cloud mode)...")
+        logger.info("🔑 Initializing client with TELEGRAM_STRING_SESSION...")
         session = StringSession(STRING_SESSION)
     else:
-        logger.info(f"📁 Initializing client with file session '{SESSION_NAME}.session' (Local mode)...")
+        logger.info(f"📁 Initializing client with local file session '{SESSION_NAME}.session'...")
         session = SESSION_NAME
 
     client = TelegramClient(session, api_id, API_HASH)
 
-    # Start the client
+    # Connect non-interactively to avoid EOFError on headless cloud environments (Render)
     logger.info("Connecting to Telegram...")
-    await client.start()
+    await client.connect()
+
+    # Verify authorization
+    if not await client.is_user_authorized():
+        # If in interactive local terminal, offer login prompt
+        if not STRING_SESSION and sys.stdin and sys.stdin.isatty():
+            logger.info("Local terminal detected. Prompting for login...")
+            await client.start()
+        else:
+            logger.critical("=" * 60)
+            logger.critical("❌ ERROR: Telegram client is NOT authorized!")
+            logger.critical("Reason: TELEGRAM_STRING_SESSION is missing or invalid in Render Environment Variables.")
+            logger.critical("=" * 60)
+            logger.critical("👉 How to fix on Render:")
+            logger.critical("1. Run 'python generate_string_session.py' on your local computer.")
+            logger.critical("2. Go to Render Dashboard -> Your Web Service -> Environment.")
+            logger.critical("3. Add environment variable: TELEGRAM_STRING_SESSION=<your_session_string>")
+            logger.critical("4. Save Changes & Redeploy.")
+            logger.critical("=" * 60)
+            sys.exit(1)
 
     me = await client.get_me()
-    logger.info(f"Logged in as: {me.first_name} (@{me.username}) [ID: {me.id}]")
+    logger.info(f"✅ Successfully logged in as: {me.first_name} (@{me.username}) [ID: {me.id}]")
 
     # Optional: Start health server if PORT is set (e.g. on Render Web Service)
     health_runner = None
