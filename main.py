@@ -1,0 +1,223 @@
+import asyncio
+import logging
+import os
+import re
+import sys
+import time
+from dotenv import load_dotenv
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+from telethon.errors import RPCError
+
+# 1. Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger("AutoResponder")
+
+# 2. Load environment variables
+load_dotenv()
+
+API_ID_RAW = os.getenv("TELEGRAM_API_ID")
+API_HASH = os.getenv("TELEGRAM_API_HASH")
+STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION", "").strip()
+SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME", "user_session").strip()
+TARGET_CONTACT_RAW = os.getenv("TARGET_CONTACT", "ALL").strip()
+AUTO_REPLY_MESSAGE = os.getenv("AUTO_REPLY_MESSAGE", "Hi, Harsha is currently busy")
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "30"))  # Cooldown per user to prevent spam
+PORT = os.getenv("PORT")  # Automatically injected by Render for Web Services
+
+# Track last reply timestamp per chat_id for cooldown
+last_reply_time = {}
+
+
+def parse_targets(target_str: str):
+    """Parses target contacts from comma-separated string or 'ALL'/'*'."""
+    if not target_str or target_str.upper() in ("ALL", "*", "ANY"):
+        return "ALL"
+    
+    targets = []
+    for item in target_str.split(","):
+        cleaned = item.strip()
+        if not cleaned:
+            continue
+        try:
+            targets.append(int(cleaned))
+        except ValueError:
+            targets.append(cleaned)
+    return targets if targets else "ALL"
+
+
+async def start_health_server(port: int):
+    """Starts a lightweight HTTP server for Render Web Service health checks."""
+    try:
+        from aiohttp import web
+        app = web.Application()
+
+        async def handle_ping(request):
+            return web.Response(text="TeleBot is running OK ✅", status=200)
+
+        app.router.add_get("/", handle_ping)
+        app.router.add_get("/health", handle_ping)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        logger.info(f"🌐 Health check HTTP server is listening on port {port} (for Render)")
+        return runner
+    except Exception as e:
+        logger.warning(f"Could not start HTTP health server on port {port}: {e}")
+        return None
+
+
+async def main():
+    # Validate API credentials
+    if not API_ID_RAW or not API_HASH:
+        logger.error("Missing TELEGRAM_API_ID or TELEGRAM_API_HASH in environment variables.")
+        print("\n[!] Please configure your Telegram API credentials:")
+        print("    TELEGRAM_API_ID=your_api_id")
+        print("    TELEGRAM_API_HASH=your_api_hash")
+        print("    TELEGRAM_STRING_SESSION=your_string_session (Required on Render)")
+        print("    TARGET_CONTACT=ALL  (or specific ID/username)\n")
+        sys.exit(1)
+
+    try:
+        api_id = int(API_ID_RAW)
+    except ValueError:
+        logger.error(f"TELEGRAM_API_ID must be a valid integer, got: {API_ID_RAW}")
+        sys.exit(1)
+
+    targets = parse_targets(TARGET_CONTACT_RAW)
+    is_all_contacts = (targets == "ALL")
+
+    logger.info(f"Target Mode: {'ALL Contacts / Private DMs' if is_all_contacts else f'Specific Targets: {targets}'}")
+    logger.info(f"Auto-Reply Message: '{AUTO_REPLY_MESSAGE}'")
+    logger.info(f"Cooldown per user: {COOLDOWN_SECONDS}s")
+
+    # Initialize TelegramClient with StringSession (cloud/Render) or SQLite Session (local)
+    if STRING_SESSION:
+        logger.info("🔑 Initializing client with StringSession (Cloud mode)...")
+        session = StringSession(STRING_SESSION)
+    else:
+        logger.info(f"📁 Initializing client with file session '{SESSION_NAME}.session' (Local mode)...")
+        session = SESSION_NAME
+
+    client = TelegramClient(session, api_id, API_HASH)
+
+    # Start the client
+    logger.info("Connecting to Telegram...")
+    await client.start()
+
+    me = await client.get_me()
+    logger.info(f"Logged in as: {me.first_name} (@{me.username}) [ID: {me.id}]")
+
+    # Optional: Start health server if PORT is set (e.g. on Render Web Service)
+    health_runner = None
+    if PORT:
+        try:
+            port_num = int(PORT)
+            health_runner = await start_health_server(port_num)
+        except ValueError:
+            logger.warning(f"Invalid PORT value '{PORT}', skipping HTTP health server.")
+
+    # Pre-resolve target entities if specific targets are set
+    resolved_target_ids = set()
+    if not is_all_contacts:
+        for t in targets:
+            try:
+                entity = await client.get_entity(t)
+                eid = getattr(entity, "id", t)
+                resolved_target_ids.add(eid)
+                name = getattr(entity, "first_name", getattr(entity, "title", str(t)))
+                logger.info(f"Resolved target: '{name}' (ID: {eid})")
+            except Exception as e:
+                logger.warning(f"Could not pre-resolve target '{t}': {e}. Using raw value.")
+                if isinstance(t, int):
+                    resolved_target_ids.add(t)
+
+    # Register NewMessage event handler with case-insensitive 'hi' pattern
+    # Regex: (?i)^hi[!.]*$ matches "hi", "Hi", "HI", "hi!", "Hi.", "HI!!", etc.
+    @client.on(events.NewMessage(incoming=True, pattern=r'(?i)^hi[!.]*$'))
+    async def auto_reply_handler(event: events.NewMessage.Event):
+        try:
+            # 1. Ignore outgoing messages or messages from yourself
+            if event.out:
+                return
+
+            # 2. Only auto-reply in private chats (DMs) to avoid spamming groups/channels
+            if not event.is_private:
+                return
+
+            # 3. Ignore messages from bots
+            sender = await event.get_sender()
+            if getattr(sender, "bot", False):
+                return
+
+            sender_name = getattr(sender, "first_name", "Unknown") if sender else "Unknown"
+            chat_id = event.chat_id
+            received_text = event.raw_text
+
+            # 4. If specific targets configured, ensure sender matches
+            if not is_all_contacts:
+                sender_username = f"@{sender.username}".lower() if getattr(sender, "username", None) else None
+                sender_id = getattr(sender, "id", chat_id)
+
+                matches_target = (
+                    sender_id in resolved_target_ids or
+                    chat_id in resolved_target_ids or
+                    (sender_username and sender_username in [str(t).lower() for t in targets])
+                )
+                if not matches_target:
+                    return
+
+            # 5. Cooldown check (prevent spamming if user sends 'hi' repeatedly)
+            now = time.time()
+            if chat_id in last_reply_time and (now - last_reply_time[chat_id]) < COOLDOWN_SECONDS:
+                remaining = int(COOLDOWN_SECONDS - (now - last_reply_time[chat_id]))
+                logger.info(f"[Cooldown] Skipping auto-reply to {sender_name} (ID: {chat_id}) - {remaining}s remaining.")
+                return
+
+            logger.info(f"[Incoming Match] From: {sender_name} (Chat ID: {chat_id}) | Text: '{received_text}'")
+
+            # 6. Dispatch automated reply
+            await event.reply(AUTO_REPLY_MESSAGE)
+            last_reply_time[chat_id] = now
+            logger.info(f"[Auto-Reply] ✅ Successfully sent auto-reply to {sender_name} (Chat ID: {chat_id})")
+
+        except RPCError as rpc_err:
+            logger.error(f"[RPC Error] Telegram error while responding: {rpc_err}")
+        except Exception as exc:
+            logger.error(f"[Handler Error] Unexpected error in event handler: {exc}", exc_info=True)
+
+    logger.info("=" * 60)
+    logger.info("🤖 Telethon Auto-Responder is ACTIVE.")
+    logger.info(f"🎯 Listening for 'Hi' from: {'ALL Private Chats' if is_all_contacts else targets}")
+    logger.info(f"💬 Auto-Response: '{AUTO_REPLY_MESSAGE}'")
+    logger.info("Press Ctrl+C to stop.")
+    logger.info("=" * 60)
+
+    # Keep client running until interrupted
+    try:
+        await client.run_until_disconnected()
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        logger.info("Shutdown signal received.")
+    finally:
+        if health_runner:
+            await health_runner.cleanup()
+            logger.info("Health server stopped.")
+        if client.is_connected():
+            await client.disconnect()
+            logger.info("Client disconnected cleanly.")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Auto-responder terminated by user.")
+    except Exception as e:
+        logger.critical(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)

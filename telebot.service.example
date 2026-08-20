@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram Personal Auto-Responder
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/TeleBot
+ExecStart=/home/ubuntu/TeleBot/.venv/bin/python main.py
+Restart=always
+RestartSec=10
+EnvironmentFile=/home/ubuntu/TeleBot/.env
+
+[Install]
+WantedBy=multi-user.target

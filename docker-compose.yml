@@ -1,0 +1,11 @@
+services:
+  telebot:
+    build: .
+    container_name: telegram_auto_responder
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist the session file across container restarts
+      - ./user_session.session:/app/user_session.session
+

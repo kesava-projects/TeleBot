@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: telebot-auto-responder
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python main.py
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELEGRAM_STRING_SESSION
+        sync: false
+      - key: TARGET_CONTACT
+        value: ALL
+      - key: AUTO_REPLY_MESSAGE
+        value: "Hi, Harsha is currently busy. I am shan harsha's bot. How can I help you today?"
+      - key: COOLDOWN_SECONDS
+        value: "30"
