@@ -20,8 +20,14 @@ logger = logging.getLogger("AutoResponder")
 # 2. Load environment variables
 load_dotenv()
 
+def sanitize_session_string(s: str) -> str:
+    """Removes all whitespace, newlines, tabs, and quotes from a session string."""
+    if not s:
+        return ""
+    return "".join(s.split()).strip("\"'")
+
 def clean_env(key: str, default: str = "") -> str:
-    """Safely retrieves and cleans environment variables (strips quotes & whitespace)."""
+    """Safely retrieves and cleans standard environment variables."""
     val = os.getenv(key, default)
     if val is None:
         return default
@@ -29,7 +35,7 @@ def clean_env(key: str, default: str = "") -> str:
 
 API_ID_RAW = clean_env("TELEGRAM_API_ID")
 API_HASH = clean_env("TELEGRAM_API_HASH")
-STRING_SESSION = clean_env("TELEGRAM_STRING_SESSION")
+STRING_SESSION = sanitize_session_string(os.getenv("TELEGRAM_STRING_SESSION", ""))
 SESSION_NAME = clean_env("TELEGRAM_SESSION_NAME", "user_session")
 TARGET_CONTACT_RAW = clean_env("TARGET_CONTACT", "ALL")
 AUTO_REPLY_MESSAGE = clean_env("AUTO_REPLY_MESSAGE", "Hi, Harsha is currently busy")
@@ -104,9 +110,18 @@ async def main():
     logger.info(f"Cooldown per user: {COOLDOWN_SECONDS}s")
 
     # Initialize TelegramClient with StringSession (cloud/Render) or SQLite Session (local)
+    session = None
     if STRING_SESSION:
-        logger.info("🔑 Initializing client with TELEGRAM_STRING_SESSION...")
-        session = StringSession(STRING_SESSION)
+        logger.info(f"🔑 Initializing client with TELEGRAM_STRING_SESSION (Length: {len(STRING_SESSION)} chars)...")
+        try:
+            session = StringSession(STRING_SESSION)
+        except Exception as err:
+            logger.critical("=" * 60)
+            logger.critical(f"❌ Failed to parse TELEGRAM_STRING_SESSION: {err}")
+            logger.critical(f"String received (first 20 chars): '{STRING_SESSION[:20]}...' (Total len: {len(STRING_SESSION)})")
+            logger.critical("Please regenerate your StringSession using: python generate_string_session.py")
+            logger.critical("=" * 60)
+            sys.exit(1)
     else:
         logger.info(f"📁 Initializing client with local file session '{SESSION_NAME}.session'...")
         session = SESSION_NAME
